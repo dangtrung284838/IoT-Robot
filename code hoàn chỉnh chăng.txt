@@ -1,0 +1,952 @@
+//---------------------- Libraries ----------------------
+#include <WiFi.h>
+#include <PubSubClient.h>
+#include <math.h>
+#include <NTPClient.h>
+#include <WiFiUdp.h>
+
+// Thư viện Fuzzy dùng cho Arduino (các file .h này phải có trong thư viện bạn cài đặt)
+// #include <Fuzzy.h>
+// #include <FuzzyInput.h>
+// #include <FuzzyOutput.h>
+// #include <FuzzySet.h>
+// #include <FuzzyRule.h>
+// #include <FuzzyRuleAntecedent.h>
+// #include <FuzzyRuleConsequent.h>
+
+struct Velocity {
+  float v_left;
+  float v_right;
+};
+
+struct DataPoint {
+    float dt;       // Thời gian tương đối (giây)
+    float rho;      // Khoảng cách đến đích
+    float x;        // Tọa độ x
+    float y;        // Tọa độ y
+    float theta;    // Góc theta
+    float alpha;    // Góc alpha
+    float v_left;   // Vận tốc bánh trái
+    float v_right;  // Vận tốc bánh phải
+};
+
+const int MAX_DATA_POINTS = 200; // Số điểm dữ liệu tối đa (100 giây với 0.5s/điểm)
+DataPoint dataBuffer[MAX_DATA_POINTS];
+int dataIndex = 0; // Chỉ số hiện tại trong mảng
+
+hw_timer_t *timer = NULL;
+volatile bool shouldLogData = false; // Cờ báo hiệu cần ghi dữ liệu
+unsigned long startTime = 0; // Thời gian bắt đầu hành trình
+float rho_log = 0, x_log = 0, y_log = 0, theta_log = 0, alpha_log = 0, v_left_log = 0, v_right_log = 0;
+volatile unsigned long interruptCount = 0;
+
+void IRAM_ATTR onTimer() {
+  shouldLogData = true; // Đặt cờ để ghi dữ liệu
+  interruptCount++; // Tăng biến đếm để debug
+}
+
+//---------------------- Function Prototypes ----------------------
+float readUltrasonicDistance(int trigPin, int echoPin);
+int classifyFront(float d);
+int classifySide(float d);
+void fuzzyControlSystem(float s0, float s45L, float s45R, float s90L, float s90R);
+void combinedControl(float &omega_left, float &omega_right);
+void moveToDestination();
+
+void publishSensorData();
+void connectWiFi();
+void reconnectMQTT();
+void callback(char* topic, byte* payload, unsigned int length);
+
+//---------------------- Global Variables ----------------------
+// Fuzzy* fuzzy = new Fuzzy();
+
+WiFiUDP ntpUDP;
+NTPClient timeClient(ntpUDP, "pool.ntp.org", 0, 60000);
+
+WiFiClient espClient;
+PubSubClient client(espClient);
+
+// (Các biến khác về sensor smoothing, MQTT, … nếu cần)
+
+// WiFi & MQTT parameters
+const char *ssid = "Dum-a-doo-dum-a-da";
+const char *password = "123456789";
+const char* mqtt_server = "cougar.rmq.cloudamqp.com";
+const int mqtt_port = 1883;
+const char* mqtt_user = "xksukske:xksukske";
+const char* mqtt_password = "xloxYDSZsx8DeCLrWhS5aQq43NOtrsQz";
+const char* mqtt_client_id = "ESP32-Motor";
+
+// Pin definitions for motors and ultrasonic sensors
+#define MOTOR1_IN1 16    // Left motor forward
+#define MOTOR1_IN2 17    // Left motor reverse
+#define MOTOR2_IN1 18    // Right motor forward
+#define MOTOR2_IN2 19    // Right motor reverse
+
+#define TRIG_FRONT 13     
+#define ECHO_FRONT 12
+#define TRIG_FRONT_RIGHT 14 
+#define ECHO_FRONT_RIGHT 27
+#define TRIG_FRONT_LEFT 26  
+#define ECHO_FRONT_LEFT 25
+#define TRIG_RIGHT 33    
+#define ECHO_RIGHT 32
+#define TRIG_LEFT 15     
+#define ECHO_LEFT 2
+
+// Robot & control parameters
+float x = 0, y = 0, theta = 0;         // Current position (cm) & heading (rad)
+float x_B = 200, y_B = 0;              // Destination (cm)
+const float L = 20.0;                  // Wheel separation (cm)
+float theta_B = 0;
+const float CORRECTION_FACTOR = 0.97;  // Correction factor for right motor
+bool isAutoMode = false;
+unsigned long lastNetworkCheck = 0;    // Thời điểm kiểm tra mạng cuối cùng
+bool networkLost = false;              // Trạng thái mất mạng
+
+float v_cmd = 0;
+float w_cmd = 0;
+
+// Sensor thresholds for classification (cm)
+const float front_TH_NEAR = 30.0;
+const float front_TH_MEDIUM = 40.0;
+const float side_TH_NEAR = 10.0;
+const float side_TH_MEDIUM = 20.0;
+const float emergency_distance = 10.0; // cm
+const float safety_distance = 30.0;    // cm
+
+// Lyapunov & Fuzzy parameters
+const float GAMMA = 0.2;
+const float K = 1.0;
+const float H = 1.5;
+
+const float R = 3.0;                   // Bán kính bánh xe (cm)
+const float MAX_ANGULAR_VELOCITY = 26; // Vận tốc góc tối đa (rad/s)
+const int PWM_MIN = 50;                // PWM tối thiểu để động cơ quay
+const int PWM_MAX = 255;               // PWM tối đa
+float EPSILON_POS = 1.0;
+const float RIGHT_WHEEL_REDUCTION = 0.951; // Giảm PWM bánh phải để cân bằng (bánh trái yếu hơn)
+
+unsigned long long ntpBaseTime = 0;
+unsigned long localBaseTime = 0;
+
+// =================== WIFI & MQTT FUNCTIONS ===================
+void connectWiFi() {
+  Serial.print("Connecting to WiFi...");
+  WiFi.begin(ssid, password);
+  WiFi.setSleep(false);
+  int retry = 0;
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+    retry++;
+    if (retry > 20) {
+      Serial.println("\nFailed to connect. Restarting...");
+      networkLost = true;
+      ESP.restart();
+    }
+  }
+  Serial.println("\nWiFi connected!");
+  Serial.print("IP Address: ");
+  Serial.println(WiFi.localIP());
+}
+
+void reconnectMQTT() {
+  while (!client.connected()) {
+    Serial.print("Connecting to MQTT...");
+    if (client.connect(mqtt_client_id, mqtt_user, mqtt_password)) {
+      Serial.println("Connected to MQTT broker!");
+      client.subscribe("dieukhien/#");
+    } else {
+      Serial.print("Failed, rc=");
+      Serial.print(client.state());
+      Serial.println(" Retrying in 0.5 seconds...");
+      networkLost = true;
+      delay(500);
+    }
+  }
+}
+
+void publishSensorData() {
+  float front = readUltrasonicDistance(TRIG_FRONT, ECHO_FRONT);
+  float front_right = readUltrasonicDistance(TRIG_FRONT_RIGHT, ECHO_FRONT_RIGHT);
+  float front_left = readUltrasonicDistance(TRIG_FRONT_LEFT, ECHO_FRONT_LEFT);
+  float right = readUltrasonicDistance(TRIG_RIGHT, ECHO_RIGHT);
+  float left = readUltrasonicDistance(TRIG_LEFT, ECHO_LEFT);
+
+  char buffer[100];
+  snprintf(buffer, sizeof(buffer), "front:%.1f,front_right:%.1f,front_left:%.1f,right:%.1f,left:%.1f",
+           (front >= 0) ? front : -1,
+           (front_right >= 0) ? front_right : -1,
+           (front_left >= 0) ? front_left : -1,
+           (right >= 0) ? right : -1,
+           (left >= 0) ? left : -1);
+  client.publish("sensors/distance", buffer);
+  Serial.print("Published sensor data: ");
+  Serial.println(buffer);
+}
+
+
+int classifyFront(float d) {
+  if (d <= front_TH_NEAR) return 3;         // Near
+  else if (d <= front_TH_MEDIUM) return 2;    // Medium
+  else return 1;                            // Far
+}
+
+int classifySide(float d) {
+  if (d <= side_TH_NEAR) return 3;          // Near
+  else if (d <= side_TH_MEDIUM) return 2;   // Medium
+  else return 1;                           // Far
+}
+
+// Unit conversion functions
+inline float rad2deg(float rad) { return rad * 180.0 / PI; }
+inline float deg2rad(float deg) { return deg * PI / 180.0; }
+
+
+
+
+//---------------------- Fuzzy Membership Functions ----------------------
+//---------------------- Fuzzy Membership Functions ----------------------
+float trapezoidalMF(float x, float a, float b, float c, float d) {
+  if (x <= a) return 0.0;
+  else if (x < b) return (x - a) / (b - a);
+  else if (x <= c) return 1.0;
+  else if (x < d) return (d - x) / (d - c);
+  else return 0.0;
+}
+
+float front_near_mf(float x)   { return trapezoidalMF(x, 0, 0, 20, 30); }    // Near: [0, 0, 20, 30]
+float front_medium_mf(float x) { return trapezoidalMF(x, 25, 30, 40, 45); }  // Medium: [25, 30, 40, 45]
+float front_far_mf(float x)    { return trapezoidalMF(x, 40, 45, 100, 100); } // Far: [40, 45, 100, 100]
+
+// Các hàm membership cho input (đơn vị: cm)
+float near_mf(float x)   { return trapezoidalMF(x, 0, 0, 10, 20); }
+float medium_mf(float x) { return trapezoidalMF(x, 15, 20, 32, 37); }
+float far_mf(float x)    { return trapezoidalMF(x, 35, 40, 100, 100); }
+
+// Hàm membership cho output (đơn vị: cm/s)
+float nega_mf(float v) { return trapezoidalMF(v, -30, -30, -30, 0); } // Nega: [-50, -50, -50, 0]
+float posi_mf(float v) { return trapezoidalMF(v, 0, 30, 30, 30); }    // Posi: [0, 50, 50, 50]
+
+//---------------------- Defuzzification (Centroid) ----------------------
+
+
+Velocity defuzzifyOutput(int nRules, float rule_strength[], bool isNegaLeft[], bool isNegaRight[], 
+                        float z_min, float z_max, float step) {
+  float numeratorLeft = 0.0, denominatorLeft = 0.0;
+  float numeratorRight = 0.0, denominatorRight = 0.0;
+  
+  for (float z = z_min; z <= z_max; z += step) {
+    float aggregatedNegaLeft = 0.0, aggregatedPosiLeft = 0.0;
+    float aggregatedNegaRight = 0.0, aggregatedPosiRight = 0.0;
+    
+    for (int i = 0; i < nRules; i++) {
+      if (rule_strength[i] > 0) {
+        float muNega = nega_mf(z);
+        float muPosi = posi_mf(z);
+        float clipped = rule_strength[i];
+        
+        if (isNegaLeft[i]) {
+          aggregatedNegaLeft = max(aggregatedNegaLeft, min(clipped, muNega));
+        } else {
+          aggregatedPosiLeft = max(aggregatedPosiLeft, min(clipped, muPosi));
+        }
+        if (isNegaRight[i]) {
+          aggregatedNegaRight = max(aggregatedNegaRight, min(clipped, muNega));
+        } else {
+          aggregatedPosiRight = max(aggregatedPosiRight, min(clipped, muPosi));
+        }
+      }
+    }
+    
+    float muLeft = max(aggregatedNegaLeft, aggregatedPosiLeft);
+    float muRight = max(aggregatedNegaRight, aggregatedPosiRight);
+    
+    numeratorLeft += z * muLeft;
+    denominatorLeft += muLeft;
+    numeratorRight += z * muRight;
+    denominatorRight += muRight;
+  }
+  
+  float v_left = (denominatorLeft > 0) ? numeratorLeft / denominatorLeft : 0.0;
+  float v_right = (denominatorRight > 0) ? numeratorRight / denominatorRight : 0.0;
+  
+  Velocity result;
+  result.v_left = v_left;
+  result.v_right = v_right;
+  return result;
+}
+// Hàm trợ giúp: lấy min của 5 số
+float min5(float a, float b, float c, float d, float e) {
+  return min(a, min(b, min(c, min(d, e))));
+}
+
+//-------------------- Fuzzy Control System --------------------
+void fuzzyControlSystem(float s0, float s45L, float s45R, float s90L, float s90R, 
+                        float &v_left, float &v_right) {
+  const int N_RULES = 47;
+  float rule_strength[N_RULES] = {0};
+  bool isNegaLeft[N_RULES];  // Luật nào gán nega cho v_left
+  bool isNegaRight[N_RULES]; // Luật nào gán nega cho v_right
+  
+  // Tính membership cho input
+  float mu_near0    = front_near_mf(s0);
+  float mu_medium0  = front_medium_mf(s0);
+  float mu_far0     = front_far_mf(s0);
+  float mu_near45L  = near_mf(s45L);
+  float mu_medium45L = medium_mf(s45L);
+  float mu_far45L   = far_mf(s45L);
+  float mu_near45R  = near_mf(s45R);
+  float mu_medium45R = medium_mf(s45R);
+  float mu_far45R   = far_mf(s45R);
+  float mu_near90L  = near_mf(s90L);
+  float mu_medium90L = medium_mf(s90L);
+  float mu_far90L   = far_mf(s90L);
+  float mu_near90R  = near_mf(s90R);
+  float mu_medium90R = medium_mf(s90R);
+  float mu_far90R   = far_mf(s90R);
+  
+  float notNear0    = max(mu_medium0, mu_far0);
+  float notNear45L  = max(mu_medium45L, mu_far45L);
+  float notNear45R  = max(mu_medium45R, mu_far45R);
+  float notNear90L  = max(mu_medium90L, mu_far90L);
+  float notNear90R  = max(mu_medium90R, mu_far90R);
+  
+  // // Emergency check: nếu sensor front quá gần, ưu tiên lùi
+  // if (s0 < 15.0 && mu_near0 > 0.7) {
+  //   v_left = -30.0;  // Lùi nhanh
+  //   v_right = -30.0;
+  //   Serial.printf("Emergency back in Fuzzy: s0 = %.2f, v_left = %.2f, v_right = %.2f\n", s0, v_left, v_right);
+  //   return;
+  // }
+  
+  // 47 luật mờ
+  rule_strength[0] = min5(mu_near0, mu_near45L, mu_near45R, mu_near90L, mu_near90R);
+  isNegaLeft[0] = true; isNegaRight[0] = true; // Lùi
+  
+  rule_strength[1] = min5(mu_near0, mu_far45L, mu_far45R, mu_far90L, mu_far90R);
+  isNegaLeft[1] = false; isNegaRight[1] = true; // Rẽ phải
+  
+  rule_strength[2] = min5(mu_near0, mu_medium45L, mu_medium45R, mu_medium90L, mu_medium90R);
+  isNegaLeft[2] = false; isNegaRight[2] = true; // Rẽ phải
+  
+  rule_strength[3] = min5(mu_near0, mu_far45L, mu_far45R, mu_far90L, mu_medium90R);
+  isNegaLeft[3] = true; isNegaRight[3] = false; // Rẽ trái
+  
+  rule_strength[4] = min5(mu_near0, mu_far45L, mu_far45R, mu_medium90L, mu_far90R);
+  isNegaLeft[4] = false; isNegaRight[4] = true; // Rẽ phải
+  
+  rule_strength[5] = min5(mu_near0, mu_far45L, mu_medium45R, mu_far90L, mu_far90R);
+  isNegaLeft[5] = true; isNegaRight[5] = false; // Rẽ trái
+  
+  rule_strength[6] = min5(mu_near0, mu_medium45L, mu_far45R, mu_far90L, mu_far90R);
+  isNegaLeft[6] = false; isNegaRight[6] = true; // Rẽ phải
+  
+  rule_strength[7] = min5(mu_near0, mu_far45L, mu_far45R, mu_medium90L, mu_medium90R);
+  isNegaLeft[7] = false; isNegaRight[7] = true; // Rẽ phải
+  
+  rule_strength[8] = min5(mu_near0, mu_far45L, mu_medium45R, mu_medium90L, mu_far90R);
+  isNegaLeft[8] = false; isNegaRight[8] = true; // Rẽ phải
+  
+  rule_strength[9] = min5(mu_near0, mu_medium45L, mu_medium45R, mu_far90L, mu_far90R);
+  isNegaLeft[9] = false; isNegaRight[9] = true; // Rẽ phải
+  
+  rule_strength[10] = min5(mu_near0, mu_medium45L, mu_far45R, mu_far90L, mu_medium90R);
+  isNegaLeft[10] = false; isNegaRight[10] = true; // Rẽ phải
+  
+  rule_strength[11] = min5(mu_near0, mu_far45L, mu_medium45R, mu_far90L, mu_medium90R);
+  isNegaLeft[11] = true; isNegaRight[11] = false; // Rẽ trái
+  
+  rule_strength[12] = min5(mu_near0, mu_medium45L, mu_far45R, mu_medium90L, mu_far90R);
+  isNegaLeft[12] = false; isNegaRight[12] = true; // Rẽ phải
+  
+  rule_strength[13] = min5(mu_near0, mu_far45L, mu_medium45R, mu_medium90L, mu_medium90R);
+  isNegaLeft[13] = true; isNegaRight[13] = false; // Rẽ trái
+  
+  rule_strength[14] = min5(mu_near0, mu_medium45L, mu_far45R, mu_medium90L, mu_medium90R);
+  isNegaLeft[14] = false; isNegaRight[14] = true; // Rẽ phải
+  
+  rule_strength[15] = min5(mu_near0, mu_medium45L, mu_medium45R, mu_far90L, mu_medium90R);
+  isNegaLeft[15] = true; isNegaRight[15] = false; // Rẽ trái
+  
+  rule_strength[16] = min5(mu_near0, mu_medium45L, mu_medium45R, mu_medium90L, mu_far90R);
+  isNegaLeft[16] = false; isNegaRight[16] = true; // Rẽ phải
+  
+  rule_strength[17] = min5(mu_near0, mu_near45L, notNear45R, mu_near90L, notNear90R);
+  isNegaLeft[17] = false; isNegaRight[17] = true; // Rẽ phải
+  
+  rule_strength[18] = min5(mu_near0, notNear45L, mu_near45R, notNear90L, mu_near90R);
+  isNegaLeft[18] = true; isNegaRight[18] = false; // Rẽ trái
+  
+  rule_strength[19] = min5(mu_near0, mu_near45L, notNear45R, notNear90L, notNear90R);
+  isNegaLeft[19] = false; isNegaRight[19] = true; // Rẽ phải
+  
+  rule_strength[20] = min5(mu_near0, notNear45L, mu_near45R, notNear90L, notNear90R);
+  isNegaLeft[20] = true; isNegaRight[20] = false; // Rẽ trái
+  
+  rule_strength[21] = min5(mu_near0, notNear45L, notNear45R, mu_near90L, notNear90R);
+  isNegaLeft[21] = false; isNegaRight[21] = true; // Rẽ phải
+  
+  rule_strength[22] = min5(mu_near0, notNear45L, notNear45R, notNear90L, mu_near90R);
+  isNegaLeft[22] = true; isNegaRight[22] = false; // Rẽ trái
+  
+  rule_strength[23] = min5(mu_near0, notNear45L, notNear45R, mu_near90L, mu_near90R);
+  isNegaLeft[23] = true; isNegaRight[23] = true; // Lùi
+  
+  rule_strength[24] = min5(mu_near0, mu_near45L, mu_near45R, notNear90L, notNear90R);
+  isNegaLeft[24] = true; isNegaRight[24] = true; // Lùi
+  
+  rule_strength[25] = min5(mu_near0, notNear45L, mu_near45R, mu_near90L, notNear90R);
+  isNegaLeft[25] = true; isNegaRight[25] = true; // Lùi
+  
+  rule_strength[26] = min5(mu_near0, mu_near45L, mu_near45R, mu_near90L, notNear90R);
+  isNegaLeft[26] = true; isNegaRight[26] = true; // Lùi
+  
+  rule_strength[27] = min5(mu_near0, mu_near45L, notNear45R, notNear90L, mu_near90R);
+  isNegaLeft[27] = true; isNegaRight[27] = true; // Lùi
+  
+  rule_strength[28] = min5(mu_near0, mu_near45L, mu_near45R, notNear90L, mu_near90R);
+  isNegaLeft[28] = true; isNegaRight[28] = true; // Lùi
+  
+  rule_strength[29] = min5(mu_near0, mu_near45L, notNear45R, mu_near90L, mu_near90R);
+  isNegaLeft[29] = true; isNegaRight[29] = true; // Lùi
+  
+  rule_strength[30] = min5(mu_near0, notNear45L, mu_near45R, mu_near90L, mu_near90R);
+  isNegaLeft[30] = true; isNegaRight[30] = true; // Lùi
+  
+  rule_strength[31] = min5(notNear0, mu_near45L, mu_near45R, mu_near90L, mu_near90R);
+  isNegaLeft[31] = true; isNegaRight[31] = true; // Lùi
+  
+  rule_strength[32] = min5(notNear0, notNear45L, notNear45R, notNear90L, notNear90R);
+  isNegaLeft[32] = false; isNegaRight[32] = false; // Tiến
+  
+  rule_strength[33] = min5(notNear0, mu_near45L, notNear45R, notNear90L, notNear90R);
+  isNegaLeft[33] = false; isNegaRight[33] = true; // Rẽ phải
+  
+  rule_strength[34] = min5(notNear0, notNear45L, mu_near45R, notNear90L, notNear90R);
+  isNegaLeft[34] = true; isNegaRight[34] = false; // Rẽ trái
+  
+  rule_strength[35] = min5(notNear0, notNear45L, notNear45R, mu_near90L, notNear90R);
+  isNegaLeft[35] = false; isNegaRight[35] = true; // Rẽ phải
+  
+  rule_strength[36] = min5(notNear0, notNear45L, notNear45R, notNear90L, mu_near90R);
+  isNegaLeft[36] = true; isNegaRight[36] = false; // Rẽ trái
+  
+  rule_strength[37] = min5(notNear0, mu_near45L, mu_near45R, notNear90L, notNear90R);
+  isNegaLeft[37] = true; isNegaRight[37] = true; // Lùi
+  
+  rule_strength[38] = min5(notNear0, mu_near45L, notNear45R, mu_near90L, notNear90R);
+  isNegaLeft[38] = false; isNegaRight[38] = true; // Rẽ phải
+  
+  rule_strength[39] = min5(notNear0, mu_near45L, notNear45R, notNear90L, mu_near90R);
+  isNegaLeft[39] = true; isNegaRight[39] = true; // Lùi
+  
+  rule_strength[40] = min5(notNear0, notNear45L, mu_near45R, notNear90L, mu_near90R);
+  isNegaLeft[40] = true; isNegaRight[40] = false; // Rẽ trái
+  
+  rule_strength[41] = min5(notNear0, notNear45L, notNear45R, mu_near90L, mu_near90R);
+  isNegaLeft[41] = false; isNegaRight[41] = false; // Tiến
+  
+  rule_strength[42] = min5(notNear0, notNear45L, mu_near45R, mu_near90L, notNear90R);
+  isNegaLeft[42] = true; isNegaRight[42] = true; // Lùi
+  
+  rule_strength[43] = min5(notNear0, notNear45L, mu_near45R, mu_near90L, mu_near90R);
+  isNegaLeft[43] = true; isNegaRight[43] = true; // Lùi
+  
+  rule_strength[44] = min5(notNear0, mu_near45L, notNear45R, mu_near90L, mu_near90R);
+  isNegaLeft[44] = true; isNegaRight[44] = true; // Lùi
+  
+  rule_strength[45] = min5(notNear0, mu_near45L, mu_near45R, notNear90L, mu_near90R);
+  isNegaLeft[45] = true; isNegaRight[45] = true; // Lùi
+  
+  rule_strength[46] = min5(notNear0, mu_near45L, mu_near45R, mu_near90L, notNear90R);
+  isNegaLeft[46] = true; isNegaRight[46] = true; // Lùi
+  
+  // Tính đầu ra bằng centroid
+  float step = 1.0;
+  Velocity velocities = defuzzifyOutput(N_RULES, rule_strength, isNegaLeft, isNegaRight, -30, 30, step);
+  v_left = velocities.v_left;
+  v_right = velocities.v_right;
+  
+
+  Serial.printf("Fuzzy output: v_left = %.2f, v_right = %.2f\n", v_left, v_right);
+}
+
+
+
+
+//---------------------- COMBINED CONTROL FUNCTION ----------------------
+// -------------------- Combined Control --------------------
+// Nếu có vật cản (ít nhất 1 sensor báo near) thì sử dụng fuzzyControlSystem()
+// Ngược lại, sử dụng điều khiển Lyapunov.
+
+bool obstaclePresent = false;
+unsigned long lastFuzzyTime = 0;
+const unsigned long FUZZY_HOLD_TIME = 500;
+
+void combinedControl(float &omega_left, float &omega_right) {
+  float s0    = readUltrasonicDistance(TRIG_FRONT, ECHO_FRONT);
+  float s45L  = readUltrasonicDistance(TRIG_FRONT_LEFT, ECHO_FRONT_LEFT);
+  float s45R  = readUltrasonicDistance(TRIG_FRONT_RIGHT, ECHO_FRONT_RIGHT);
+  float s90L  = readUltrasonicDistance(TRIG_LEFT, ECHO_LEFT);
+  float s90R  = readUltrasonicDistance(TRIG_RIGHT, ECHO_RIGHT);
+  
+  obstaclePresent = false;
+  if (s0 > 0 && classifyFront(s0) == 3) obstaclePresent = true;
+  if (s45L > 0 && classifySide(s45L) == 3) obstaclePresent = true;
+  if (s45R > 0 && classifySide(s45R) == 3) obstaclePresent = true;
+  if (s90L > 0 && classifySide(s90L) == 3) obstaclePresent = true;
+  if (s90R > 0 && classifySide(s90R) == 3) obstaclePresent = true;
+  
+  if (obstaclePresent) {
+    lastFuzzyTime = millis();
+  }
+
+  if (obstaclePresent || (millis() - lastFuzzyTime < FUZZY_HOLD_TIME)) {
+    float v_left_temp, v_right_temp;
+    fuzzyControlSystem(s0, s45L, s45R, s90L, s90R, v_left_temp, v_right_temp);
+    omega_left = v_left_temp / R;
+    omega_right = v_right_temp / R;
+    client.publish("status/mode", "Fuzzy mode");
+  } else {
+    float dx = x_B - x;
+    float dy = y_B - y;
+    float rho = sqrt(dx * dx + dy * dy);
+    float rho_m = rho / 100.0;
+    float goal_angle = atan2(dy, dx);
+    float alpha = goal_angle - theta;
+    while (alpha > PI) alpha -= 2 * PI;
+    while (alpha < -PI) alpha += 2 * PI;
+    // if (alpha > (2*PI / 3)) alpha = (2*PI / 3);
+    // if (alpha < -(2*PI / 3)) alpha = -(2*PI / 3);
+    float beta = -alpha - theta;
+
+    float u = GAMMA * tanh(rho_m / 1.0) * cos(alpha);
+    float sin_alpha_over_alpha = (fabs(alpha) < 1e-6) ? 1.0 : sin(alpha) / alpha;
+    float tanh_rho_over_rho = (fabs(rho_m) < 1e-6) ? 1.0 : tanh(rho_m / 1.0) / (rho_m / 1.0);
+    float w = K * alpha + GAMMA * sin_alpha_over_alpha * tanh_rho_over_rho * cos(alpha) * (alpha + H * beta);
+
+    u *= 100.0; // Chuyển u từ m/s sang cm/s
+
+    // Tính vận tốc góc của bánh xe (rad/s)
+    omega_left = (u - w * L / 2.0) / R;  // rad/s
+    omega_right = (u + w * L / 2.0) / R; // rad/s
+    client.publish("status/mode", "Lyapunov mode");
+  }
+}
+
+
+
+
+
+// =================== SENSOR FUNCTIONS ===================
+float readUltrasonicDistance(int trigPin, int echoPin) {
+  digitalWrite(trigPin, LOW);
+  delayMicroseconds(2);
+  digitalWrite(trigPin, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(trigPin, LOW);
+  long duration = pulseIn(echoPin, HIGH, 30000);
+  if (duration == 0) return 99;
+  float distance = duration * 0.034 / 2.0;
+  if (distance > 99) distance = 99;
+  return distance;
+}
+
+//---------------------- MOVE TO DESTINATION FUNCTION ----------------------
+void moveToDestination() {
+  float rho = sqrt(pow(x_B - x, 2) + pow(y_B - y, 2));
+  if (rho < EPSILON_POS) {
+    Serial.println("Destination too close, no movement needed!");
+    return;
+  }
+  
+  Serial.println("Bắt đầu di chuyển tự động đến đích...");
+  isAutoMode = true; // Bật chế độ tự động
+  unsigned long startTime = millis();
+  unsigned long lastUpdate = millis();
+  const unsigned long updateInterval = 50; // 100ms
+
+  unsigned long lastSignificantRhoChange = millis();
+  float lastRho = rho;
+  const unsigned long RHO_STUCK_TIME = 5000; // 3 giây
+  const float RHO_CHANGE_THRESHOLD = 1.0; // cm
+  
+  while (rho > EPSILON_POS && isAutoMode) { // Thoát nếu isAutoMode = false
+    unsigned long now = millis();
+    if (now - lastUpdate < updateInterval) continue;
+    float dt = 0.05;
+
+    lastUpdate = now;
+    
+    float t = (now - startTime) / 1000.0;
+
+    float omega_left, omega_right;
+    combinedControl(omega_left, omega_right);
+    
+
+    int pwmL = map(abs(omega_left), 0, MAX_ANGULAR_VELOCITY, PWM_MIN, PWM_MAX);
+    int pwmR = map(abs(omega_right), 0, MAX_ANGULAR_VELOCITY, PWM_MIN, PWM_MAX);
+
+    float dx = x_B - x;
+    float dy = y_B - y;
+    float goal_angle = atan2(dy, dx);
+    float alpha = goal_angle - theta;
+
+    pwmR = (int)(pwmR * RIGHT_WHEEL_REDUCTION);
+
+    // Áp dụng RIGHT_WHEEL_REDUCTION linh hoạt dựa trên alpha
+    if (alpha > 0) { // rẽ trái
+      pwmR = (int)(pwmR)*1.022; // Áp dụng hệ số để đi thẳng chính xác
+      pwmL = (int)(pwmL);
+
+    } else if (alpha < 0) { // Rẽ phải (alpha âm)
+      pwmL = (int)(pwmL);
+      pwmR = (int)(pwmR); // Bỏ RIGHT_WHEEL_REDUCTION để tăng góc rẽ phải
+    }
+
+    if (pwmL > PWM_MAX) pwmL = PWM_MAX;
+    if (pwmL < PWM_MIN) pwmL = 0;
+    if (pwmR > PWM_MAX) pwmR = PWM_MAX;
+    if (pwmR < PWM_MIN) pwmR = 0;
+    
+    if (omega_left > 0) {
+      ledcWrite(MOTOR1_IN1, pwmL);
+      ledcWrite(MOTOR1_IN2, 0);
+    } else if (omega_left < 0) {
+      ledcWrite(MOTOR1_IN1, 0);
+      ledcWrite(MOTOR1_IN2, pwmL);
+    } else {
+      ledcWrite(MOTOR1_IN1, 0);
+      ledcWrite(MOTOR1_IN2, 0);
+    }
+    
+    if (omega_right > 0) {
+      ledcWrite(MOTOR2_IN1, pwmR);
+      ledcWrite(MOTOR2_IN2, 0);
+    } else if (omega_right < 0) {
+      ledcWrite(MOTOR2_IN1, 0);
+      ledcWrite(MOTOR2_IN2, pwmR);
+    } else {
+      ledcWrite(MOTOR2_IN1, 0);
+      ledcWrite(MOTOR2_IN2, 0);
+    }
+    
+
+    float v_left = omega_left * R;
+    float v_right = omega_right * R;
+    
+    float u = (omega_left * R + omega_right * R) / 2.0; // cm/s
+    float w = (omega_right * R - omega_left * R) / L;   // rad/s
+    theta += w * dt;
+    x += u * cos(theta) * dt;
+    y += u * sin(theta) * dt;
+
+    while (theta > PI) theta -= 2 * PI;
+    while (theta < -PI) theta += 2 * PI;
+
+    rho = sqrt(pow(x_B - x, 2) + pow(y_B - y, 2));
+
+    dx = x_B - x;
+    dy = y_B - y;
+    goal_angle = atan2(dy, dx);
+    alpha = goal_angle - theta;
+    if (alpha > PI / 2) alpha = PI / 2;
+    if (alpha < -PI / 2) alpha = -PI / 2;
+    float beta = -alpha - theta;
+
+    char dataBuf[200];
+    snprintf(dataBuf, sizeof(dataBuf), 
+             "t:%.3f,mode:%s,rho:%.2f,x:%.2f,y:%.2f,theta:%.2f,alpha:%.2f,beta:%.2f,u:%.2f,w:%.2f,v_left:%.2f,v_right:%.2f", 
+             t, (obstaclePresent || (millis() - lastFuzzyTime < FUZZY_HOLD_TIME)) ? "Fuzzy" : "Lyapunov", 
+             rho, x, y, theta, alpha, beta, u, w, v_left, v_right);
+    client.publish("status/data", dataBuf);
+
+    if (fabs(lastRho - rho) > RHO_CHANGE_THRESHOLD) {
+      lastSignificantRhoChange = now;
+      lastRho = rho;
+    } else if (now - lastSignificantRhoChange > RHO_STUCK_TIME) {
+      if (!(obstaclePresent || (millis() - lastFuzzyTime < FUZZY_HOLD_TIME))) {
+        Serial.println("Rho not decreasing significantly, assuming destination reached!");
+        break; // Thoát vòng lặp, coi như đã đến đích
+      }
+    }
+
+    
+    
+    client.loop();
+  }
+  
+  ledcWrite(MOTOR1_IN1, 0); ledcWrite(MOTOR1_IN2, 0);
+  ledcWrite(MOTOR2_IN1, 0); ledcWrite(MOTOR2_IN2, 0);
+  
+  if (isAutoMode) {
+    Serial.println("Đã đến đích!");
+    x = 0; y = 0; theta = 0;
+    Serial.println("Reset vị trí robot: (0,0,0)");
+  } else {
+    Serial.println("Chế độ tự động bị gián đoạn bởi lệnh thủ công!");
+  }
+  isAutoMode = false; // Tắt chế độ tự động
+}
+
+
+
+//---------------------- MQTT CALLBACK ----------------------
+void callback(char* topic, byte* payload, unsigned int length) {
+  String message;
+  for (unsigned int i = 0; i < length; i++) {
+    message += (char)payload[i];
+  }
+  Serial.print("Received message [");
+  Serial.print(topic);
+  Serial.print("]: ");
+  Serial.println(message);
+
+  // Tách lệnh và timestamp
+  int commaIndex = message.lastIndexOf(',');
+  String command;
+  unsigned long long sendTime = 0;
+  if (commaIndex != -1) {
+    command = message.substring(0, commaIndex);
+    String timestampStr = message.substring(commaIndex + 1);
+    
+    Serial.print("Raw timestamp from app: ");
+    Serial.println(timestampStr);
+    
+    sendTime = atoll(timestampStr.c_str());
+
+    // Tính receiveTime bằng NTP + millis()
+    unsigned long currentMillis = millis();
+    unsigned long long elapsedMillis = currentMillis - localBaseTime;
+    unsigned long long receiveTime = (ntpBaseTime * 1000) + elapsedMillis;
+
+    // In để kiểm tra
+    Serial.printf("sendTime: %llu, receiveTime: %llu\n", sendTime, receiveTime);
+
+    // Tính độ trễ
+    long long latency = (long long)receiveTime - (long long)sendTime;
+    if (latency < 0) {
+      Serial.printf("Độ trễ âm (lỗi đồng bộ): %lld ms\n", latency);
+    } else {
+      Serial.printf("Độ trễ (app -> ESP32): %lld ms\n", latency);
+    }
+
+    // Gửi độ trễ về app
+    char latencyBuf[20];
+    snprintf(latencyBuf, sizeof(latencyBuf), "%lu", (unsigned long)(latency < 0 ? 0 : latency));
+    client.publish("status/latency", latencyBuf);
+  } else {
+    command = message;
+  }
+
+  // Xử lý lệnh
+  if (command == "tien") {
+    v_cmd = 20; w_cmd = 0;
+    isAutoMode = false;
+    Serial.println("Xe tiến");
+  } else if (command == "lui") {
+    v_cmd = -20; w_cmd = 0;
+    isAutoMode = false;
+    Serial.println("Xe lùi");
+  } else if (command == "trai") {
+    v_cmd = 20; w_cmd = 0.8;
+    isAutoMode = false;
+    Serial.println("Xe rẽ trái");
+  } else if (command == "phai") {
+    v_cmd = 20; w_cmd = -0.8;
+    isAutoMode = false;
+    Serial.println("Xe rẽ phải");
+  } else if (command == "dung") {
+    v_cmd = 0; w_cmd = 0;
+    isAutoMode = false;
+    Serial.println("Xe dừng");
+  } else if (command.startsWith("x:")) {
+    int xIndex = command.indexOf("x:") + 2;
+    int commaIndex = command.indexOf(",");
+    int yIndex = command.indexOf("y:") + 2;
+    if (commaIndex == -1 || yIndex == -1) {
+      Serial.println("Định dạng thông điệp không hợp lệ!");
+      return;
+    }
+    String xStr = command.substring(xIndex, commaIndex);
+    String yStr = command.substring(yIndex);
+    x_B = xStr.toFloat();
+    y_B = yStr.toFloat();
+    theta_B = atan2(y_B, x_B);
+    theta = 0;
+    Serial.printf("Tọa độ đích mới: (x_B, y_B) = (%.2f, %.2f) cm\n", x_B, y_B);
+    moveToDestination();
+    return;
+  }
+}
+void setup() {
+  Serial.begin(115200);
+  Serial.setDebugOutput(true);
+  Serial.println();
+
+  // Initialize motor pins
+  pinMode(MOTOR1_IN1, OUTPUT);
+  pinMode(MOTOR1_IN2, OUTPUT);
+  pinMode(MOTOR2_IN1, OUTPUT);
+  pinMode(MOTOR2_IN2, OUTPUT);
+  digitalWrite(MOTOR1_IN1, LOW);
+  digitalWrite(MOTOR1_IN2, LOW);
+  digitalWrite(MOTOR2_IN1, LOW);
+  digitalWrite(MOTOR2_IN2, LOW);
+
+  // Initialize ultrasonic sensor pins
+  pinMode(TRIG_FRONT, OUTPUT);   pinMode(ECHO_FRONT, INPUT);
+  pinMode(TRIG_FRONT_RIGHT, OUTPUT);   pinMode(ECHO_FRONT_RIGHT, INPUT);
+  pinMode(TRIG_FRONT_LEFT, OUTPUT);    pinMode(ECHO_FRONT_LEFT, INPUT);
+  pinMode(TRIG_RIGHT, OUTPUT);     pinMode(ECHO_RIGHT, INPUT);
+  pinMode(TRIG_LEFT, OUTPUT);      pinMode(ECHO_LEFT, INPUT);
+  digitalWrite(TRIG_FRONT, LOW);
+  digitalWrite(TRIG_FRONT_RIGHT, LOW);
+  digitalWrite(TRIG_FRONT_LEFT, LOW);
+  digitalWrite(TRIG_RIGHT, LOW);
+  digitalWrite(TRIG_LEFT, LOW);
+
+  connectWiFi();
+  timeClient.begin();
+
+  // Đồng bộ NTP và millis() khi khởi động
+  if (timeClient.update()) {
+    ntpBaseTime = (unsigned long long)timeClient.getEpochTime(); // Giây
+    localBaseTime = millis(); // Thời gian millis() tại thời điểm đồng bộ (ms)
+    Serial.printf("NTP Base Time: %llu s, Local Base Time: %lu ms\n", ntpBaseTime, localBaseTime);
+  } else {
+    Serial.println("Failed to sync NTP at startup!");
+  }
+
+  client.setBufferSize(16384);
+  client.setServer(mqtt_server, mqtt_port);
+  client.setCallback(callback);
+  
+  // Setup motor PWM channels using ledc on ESP32
+  ledcAttach(MOTOR1_IN1, 5000, 8);
+  ledcAttach(MOTOR1_IN2, 5000, 8);
+  ledcAttach(MOTOR2_IN1, 5000, 8);
+  ledcAttach(MOTOR2_IN2, 5000, 8);
+  ledcWrite(MOTOR1_IN1, 0);   ledcWrite(MOTOR1_IN2, 0);
+  ledcWrite(MOTOR2_IN1, 0);   ledcWrite(MOTOR2_IN2, 0);
+
+  timer = timerBegin(1000000); // Tần số 2 Hz (2 lần/giây => 0.5 giây/lần)
+  timerAttachInterrupt(timer, &onTimer);
+  timerAlarm(timer, 500000, true, 0);
+}
+
+void loop() {
+  unsigned long now = millis();
+
+  // Kiểm tra trạng thái mạng mỗi 500ms
+  if (now - lastNetworkCheck > 500) {
+    lastNetworkCheck = now;
+    
+    if (WiFi.status() != WL_CONNECTED) {
+      Serial.println("WiFi disconnected!");
+      networkLost = true;
+    } else if (!client.connected()) {
+      Serial.println("MQTT disconnected!");
+      networkLost = true;
+    } else {
+      if (networkLost) {
+        Serial.println("Network restored!");
+        if (!isAutoMode) {
+          client.publish("status", "Network restored");
+        }
+      }
+      networkLost = false;
+    }
+
+    // Chỉ dừng xe nếu mất mạng và ở chế độ thủ công
+    if (networkLost && !isAutoMode) {
+      v_cmd = 0; w_cmd = 0;
+      ledcWrite(MOTOR1_IN1, 0); ledcWrite(MOTOR1_IN2, 0);
+      ledcWrite(MOTOR2_IN1, 0); ledcWrite(MOTOR2_IN2, 0);
+      Serial.println("Network lost! Robot stopped in manual mode.");
+    }
+
+    // Thử kết nối lại mạng
+    if (networkLost) {
+      if (WiFi.status() != WL_CONNECTED) {
+        Serial.println("Attempting to reconnect WiFi...");
+        connectWiFi();
+      } else if (!client.connected()) {
+        Serial.println("Attempting to reconnect MQTT...");
+        reconnectMQTT();
+      }
+    }
+  }
+
+  // Điều khiển động cơ trong chế độ thủ công
+  if (!isAutoMode) {
+    float vL = v_cmd - (w_cmd * L / 2.0);
+    float vR = (v_cmd + (w_cmd * L / 2.0));
+
+    if (vL > 20) vL = 20;
+    if (vL < -20) vL = -20;
+    if (vR > 20) vR = 20;
+    if (vR < -20) vR = -20;
+
+    float omega_left = vL / R;
+    float omega_right = vR / R;
+
+
+    int pwmL = map(abs(omega_left), 0, MAX_ANGULAR_VELOCITY, PWM_MIN, PWM_MAX);
+    int pwmR = map(abs(omega_right), 0, MAX_ANGULAR_VELOCITY, PWM_MIN, PWM_MAX);
+
+    if (omega_right >= 0) {
+      pwmR = (int)(pwmR * RIGHT_WHEEL_REDUCTION); // Đi tiến
+    } else {
+      pwmR = (int)(pwmR * RIGHT_WHEEL_REDUCTION*0.96); // Đi lùi
+    }
+
+
+    if (omega_left > 0) {
+      ledcWrite(MOTOR1_IN1, pwmL);
+      ledcWrite(MOTOR1_IN2, 0);
+    } else if (omega_left < 0) {
+      ledcWrite(MOTOR1_IN1, 0);
+      ledcWrite(MOTOR1_IN2, pwmL);
+    } else {
+      ledcWrite(MOTOR1_IN1, 0);
+      ledcWrite(MOTOR1_IN2, 0);
+    }
+
+    if (omega_right > 0) {
+      ledcWrite(MOTOR2_IN1, pwmR);
+      ledcWrite(MOTOR2_IN2, 0);
+    } else if (omega_right < 0) {
+      ledcWrite(MOTOR2_IN1, 0);
+      ledcWrite(MOTOR2_IN2, pwmR);
+    } else {
+      ledcWrite(MOTOR2_IN1, 0);
+      ledcWrite(MOTOR2_IN2, 0);
+    }
+  }
+
+  // Xử lý tin nhắn MQTT nếu còn kết nối
+  if (!networkLost) {
+    client.loop();
+  }
+
+  // Gửi heartbeat
+  static unsigned long lastMsgTime = 0;
+  const long heartbeatInterval = 5000;
+  if (now - lastMsgTime > heartbeatInterval && !networkLost && !isAutoMode) {
+    lastMsgTime = now;
+    Serial.println("Publishing heartbeat...");
+    client.publish("status", "ESP32-Motor online");
+  }
+  
+  // Cập nhật dữ liệu cảm biến
+  static unsigned long lastSensorTime = 0;
+  const long sensorInterval = 500;
+  if (now - lastSensorTime > sensorInterval && !networkLost && !isAutoMode) {
+    lastSensorTime = now;
+    publishSensorData();
+  }
+}

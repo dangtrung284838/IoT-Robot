@@ -1,0 +1,282 @@
+package com.example.myapplication;
+
+import android.os.Bundle;
+import android.util.Log;
+import android.view.MotionEvent;
+import android.webkit.WebChromeClient;
+import android.webkit.WebViewClient;
+import android.widget.Button;
+import android.widget.EditText;
+import android.widget.Toast;
+
+import androidx.activity.EdgeToEdge;
+import androidx.appcompat.app.AppCompatActivity;
+import androidx.core.graphics.Insets;
+import androidx.core.view.ViewCompat;
+import androidx.core.view.WindowInsetsCompat;
+
+import org.eclipse.paho.android.service.MqttAndroidClient;
+import org.eclipse.paho.client.mqttv3.IMqttActionListener;
+import org.eclipse.paho.client.mqttv3.IMqttDeliveryToken;
+import org.eclipse.paho.client.mqttv3.IMqttToken;
+import org.eclipse.paho.client.mqttv3.MqttCallback;
+import org.eclipse.paho.client.mqttv3.MqttClient;
+import org.eclipse.paho.client.mqttv3.MqttConnectOptions;
+import org.eclipse.paho.client.mqttv3.MqttException;
+import org.eclipse.paho.client.mqttv3.MqttMessage;
+
+import android.webkit.WebView;
+import android.net.ConnectivityManager;
+import android.net.NetworkInfo;
+
+public class MainActivity extends AppCompatActivity {
+
+    private Button btnTien, btnLui, btnTrai, btnPhai, btnGo;
+    private EditText editTextDistance, editTextAngle;
+    MqttAndroidClient client;
+    MqttConnectOptions options;
+
+    static String MQTTHOST = "tcp://cougar.rmq.cloudamqp.com:1883";
+    static String USERNAME = "ltsogsmj:ltsogsmj";
+    static String PASSWORD = "cbLqh_ejY5Bqs7x7EAXSHr3ESaml-O4X";
+
+    @Override
+    protected void onCreate(Bundle savedInstanceState) {
+        super.onCreate(savedInstanceState);
+        EdgeToEdge.enable(this);
+        setContentView(R.layout.activity_main);
+
+        // Khởi tạo WebView camera
+        WebView webViewCamera = findViewById(R.id.webViewCamera);
+        webViewCamera.getSettings().setJavaScriptEnabled(true);
+        webViewCamera.getSettings().setLoadWithOverviewMode(true);
+        webViewCamera.getSettings().setUseWideViewPort(true);
+        webViewCamera.getSettings().setDomStorageEnabled(true);
+        webViewCamera.setWebViewClient(new WebViewClient());
+        webViewCamera.setWebChromeClient(new WebChromeClient());
+        webViewCamera.loadUrl("http://172.20.10.13:81/stream");
+
+        // Khai báo các nút điều khiển và EditText
+        btnTien = findViewById(R.id.btnTien);
+        btnLui = findViewById(R.id.btnLui);
+        btnTrai = findViewById(R.id.btnTrai);
+        btnPhai = findViewById(R.id.btnPhai);
+        btnGo = findViewById(R.id.btnGo);
+        editTextDistance = findViewById(R.id.editTextDistance);
+        editTextAngle = findViewById(R.id.editTextAngle);
+
+        // Thiết lập insets cho layout
+        ViewCompat.setOnApplyWindowInsetsListener(findViewById(R.id.main), (v, insets) -> {
+            Insets systemBars = insets.getInsets(WindowInsetsCompat.Type.systemBars());
+            v.setPadding(systemBars.left, systemBars.top, systemBars.right, systemBars.bottom);
+            return insets;
+        });
+
+        // Cấu hình MQTT
+        String clientId = MqttClient.generateClientId();
+        client = new MqttAndroidClient(getApplicationContext(), MQTTHOST, clientId);
+
+        options = new MqttConnectOptions();
+        options.setUserName(USERNAME);
+        options.setPassword(PASSWORD.toCharArray());
+
+        // Kết nối MQTT lần đầu
+        connectMqtt();
+
+        client.setCallback(new MqttCallback() {
+            @Override
+            public void connectionLost(Throwable cause) {
+                Log.d("MQTT", "Connection lost: " + (cause != null ? cause.getMessage() : "Unknown reason"));
+                Toast.makeText(MainActivity.this, "MQTT connection lost! Reconnecting...", Toast.LENGTH_SHORT).show();
+                connectMqtt(); // Kết nối lại khi mất kết nối
+            }
+
+            @Override
+            public void messageArrived(String topic, MqttMessage message) throws Exception {
+                // Không cần xử lý topic "temp" nữa
+            }
+
+            @Override
+            public void deliveryComplete(IMqttDeliveryToken token) { }
+        });
+
+        // Sử dụng onTouch để gửi lệnh khi nhấn và dừng khi nhả nút
+        btnTien.setOnTouchListener((v, event) -> {
+            switch (event.getAction()) {
+                case MotionEvent.ACTION_DOWN:
+                    PUB(client, "dieukhien/tien", "tien", true);
+                    break;
+                case MotionEvent.ACTION_UP:
+                    PUB(client, "dieukhien/dung", "dung", true);
+                    break;
+            }
+            return true;
+        });
+
+        btnLui.setOnTouchListener((v, event) -> {
+            switch (event.getAction()) {
+                case MotionEvent.ACTION_DOWN:
+                    PUB(client, "dieukhien/lui", "lui", true);
+                    break;
+                case MotionEvent.ACTION_UP:
+                    PUB(client, "dieukhien/dung", "dung", true);
+                    break;
+            }
+            return true;
+        });
+
+        btnTrai.setOnTouchListener((v, event) -> {
+            switch (event.getAction()) {
+                case MotionEvent.ACTION_DOWN:
+                    PUB(client, "dieukhien/trai", "trai", true);
+                    break;
+                case MotionEvent.ACTION_UP:
+                    PUB(client, "dieukhien/dung", "dung", true);
+                    break;
+            }
+            return true;
+        });
+
+        btnPhai.setOnTouchListener((v, event) -> {
+            switch (event.getAction()) {
+                case MotionEvent.ACTION_DOWN:
+                    PUB(client, "dieukhien/phai", "phai", true);
+                    break;
+                case MotionEvent.ACTION_UP:
+                    PUB(client, "dieukhien/dung", "dung", true);
+                    break;
+            }
+            return true;
+        });
+
+        btnGo.setOnClickListener(v -> {
+            String distanceStr = editTextDistance.getText().toString().trim();
+            String angleStr = editTextAngle.getText().toString().trim();
+
+            if (distanceStr.isEmpty() || angleStr.isEmpty()) {
+                Toast.makeText(MainActivity.this, "Vui lòng nhập cả khoảng cách và góc!", Toast.LENGTH_SHORT).show();
+                return;
+            }
+
+            try {
+                float distance = Float.parseFloat(distanceStr);
+                float angle = Float.parseFloat(angleStr);
+
+                if (distance <= 0) {
+                    Toast.makeText(MainActivity.this, "Khoảng cách phải lớn hơn 0!", Toast.LENGTH_SHORT).show();
+                    return;
+                }
+
+                String message = "distance:" + distance + ",angle:" + angle;
+                PUB(client, "dieukhien/auto", message, true);
+                Toast.makeText(MainActivity.this, "Đang di chuyển: " + message, Toast.LENGTH_SHORT).show();
+
+            } catch (NumberFormatException e) {
+                Toast.makeText(MainActivity.this, "Vui lòng nhập số hợp lệ!", Toast.LENGTH_SHORT).show();
+            }
+        });
+    }
+
+    private boolean isNetworkAvailable() {
+        ConnectivityManager connectivityManager = (ConnectivityManager) getSystemService(CONNECTIVITY_SERVICE);
+        NetworkInfo activeNetworkInfo = connectivityManager.getActiveNetworkInfo();
+        return activeNetworkInfo != null && activeNetworkInfo.isConnected();
+    }
+
+    private void connectMqtt() {
+        // Kiểm tra trạng thái mạng
+        if (!isNetworkAvailable()) {
+            Log.d("MQTT", "No network available. Cannot connect to MQTT.");
+            Toast.makeText(MainActivity.this, "No network available. Please check your connection.", Toast.LENGTH_SHORT).show();
+            return;
+        }
+
+        // Kiểm tra trạng thái kết nối MQTT
+        if (client != null && !client.isConnected()) {
+            Log.d("MQTT", "MQTT not connected. Attempting to connect...");
+            try {
+                IMqttToken token = client.connect(options);
+                token.setActionCallback(new IMqttActionListener() {
+                    @Override
+                    public void onSuccess(IMqttToken asyncActionToken) {
+                        Toast.makeText(MainActivity.this, "Connected to MQTT", Toast.LENGTH_LONG).show();
+                        Log.d("MQTT", "Connected successfully");
+                        try {
+                            client.subscribe("dieukhien/#", 1);
+                        } catch (MqttException e) {
+                            e.printStackTrace();
+                        }
+                    }
+
+                    @Override
+                    public void onFailure(IMqttToken asyncActionToken, Throwable exception) {
+                        Toast.makeText(MainActivity.this, "Connection failed: " + exception.getMessage(), Toast.LENGTH_LONG).show();
+                        Log.d("MQTT", "Connection failed: " + exception.getMessage());
+                    }
+                });
+            } catch (MqttException e) {
+                e.printStackTrace();
+                Toast.makeText(MainActivity.this, "Failed to connect to MQTT: " + e.getMessage(), Toast.LENGTH_SHORT).show();
+            }
+        } else {
+            Log.d("MQTT", "MQTT already connected.");
+        }
+    }
+
+    public void SUB(MqttAndroidClient client, String topic) {
+        int qos = 1;
+        try {
+            IMqttToken subToken = client.subscribe(topic, qos);
+            subToken.setActionCallback(new IMqttActionListener() {
+                @Override
+                public void onSuccess(IMqttToken asyncActionToken) { }
+                @Override
+                public void onFailure(IMqttToken asyncActionToken, Throwable exception) { }
+            });
+        } catch (MqttException e) {
+            e.printStackTrace();
+        }
+    }
+
+    public void PUB(MqttAndroidClient client, String topic, String message, boolean includeTimestamp) {
+        // Kiểm tra trạng thái mạng và MQTT trước khi gửi
+        if (!isNetworkAvailable()) {
+            Toast.makeText(MainActivity.this, "No network available. Please check your connection.", Toast.LENGTH_SHORT).show();
+            return;
+        }
+
+        if (client == null || !client.isConnected()) {
+            Toast.makeText(MainActivity.this, "MQTT not connected. Reconnecting...", Toast.LENGTH_SHORT).show();
+            connectMqtt();
+            return;
+        }
+
+        try {
+            String finalMessage = message;
+            if (includeTimestamp) {
+                long timestamp = System.currentTimeMillis();
+                finalMessage = message + "," + timestamp;
+            }
+            MqttMessage msg = new MqttMessage();
+            msg.setPayload(finalMessage.getBytes());
+            client.publish(topic, msg);
+            Toast.makeText(MainActivity.this, "Sent: " + finalMessage, Toast.LENGTH_SHORT).show();
+        } catch (MqttException e) {
+            e.printStackTrace();
+            Toast.makeText(MainActivity.this, "Failed to send message. Reconnecting...", Toast.LENGTH_SHORT).show();
+            connectMqtt();
+        }
+    }
+
+    @Override
+    protected void onDestroy() {
+        super.onDestroy();
+        if (client != null) {
+            try {
+                client.disconnect();
+            } catch (MqttException e) {
+                e.printStackTrace();
+            }
+        }
+    }
+}
